@@ -21,6 +21,21 @@ import type { BodyName } from "../worklet/protocol.ts";
 import { BodyPad } from "./components/BodyPad.tsx";
 import { presetOf, PRESETS } from "./body.ts";
 
+export interface CustomVoicePreset {
+  id: string;
+  name: string;
+  acoustics?: { median_f0_hz?: number; median_midi?: number };
+  chimera_preset: {
+    cli_body: string;
+    cli_body_by_timbre?: string;
+    body_blend: { male: number; female: number; child: number };
+    play_voice: { pitch_hz: number; pressed_pct: number; vibrato_cents: number };
+    play_tone: { breathy_pct: number; rough_pct: number; fry_pct: number };
+    play_throat_larynx: { larynx_pct: number; twang_pct: number };
+    sing_encoders: { vibrato_depth_cents: number; vibrato_rate_hz: number; breathy_pct: number; ring_pct: number };
+  };
+}
+
 // three.js only loads when the 3D view is first shown
 const AnatomyView3D = lazy(() => import("./components/AnatomyView3D.tsx").then((m) => ({ default: m.AnatomyView3D })));
 // the duet page (`?show=<id>`): two (or more) 3D heads replaying a pre-rendered song
@@ -32,7 +47,7 @@ function showId(): string | null {
   return id && /^[\w-]+$/.test(id) ? id : null;
 }
 
-function TopBar(props: { onOpenShow: (id: string) => void }) {
+function TopBar(props: { onOpenShow: (id: string) => void; onOpenAddSynth: () => void }) {
   const started = useStore((s) => s.started);
   const volume = useStore((s) => s.volume);
   const setVolume = useStore((s) => s.setVolume);
@@ -65,6 +80,9 @@ function TopBar(props: { onOpenShow: (id: string) => void }) {
         />
         <Chip on={false} onClick={() => props.onOpenShow("sandman")}>
           Show
+        </Chip>
+        <Chip on={false} onClick={props.onOpenAddSynth}>
+          + Synth
         </Chip>
       </div>
       <div className="topbar-right">
@@ -105,16 +123,24 @@ function ViewToggles() {
   );
 }
 
-/** The body, in the head's header: three presets and the triangle between them. */
-function BodyControl() {
+/** The body, in the head's header: three presets, custom synths, and the triangle between them. */
+function BodyControl(props: {
+  customPresets: CustomVoicePreset[];
+  activePresetId: string | null;
+  onSelectPreset: (p: CustomVoicePreset) => void;
+  onClearCustom: () => void;
+}) {
   const body = useStore((s) => s.body);
   const setBody = useStore((s) => s.setBody);
   return (
-    <div className="body-control">
+    <div className="body-control" style={{ flexWrap: "wrap", gap: "0.4rem" }}>
       <Segmented<BodyName>
         label="Body"
         value={presetOf(body)}
-        onChange={(b) => setBody(PRESETS[b])}
+        onChange={(b) => {
+          props.onClearCustom();
+          setBody(PRESETS[b]);
+        }}
         options={[
           { value: "male", label: "Male" },
           { value: "female", label: "Female" },
@@ -122,18 +148,47 @@ function BodyControl() {
         ]}
       />
       <BodyPad />
+      {props.customPresets.map((cp) => (
+        <Chip
+          key={cp.id}
+          on={props.activePresetId === cp.id}
+          onClick={() => props.onSelectPreset(cp)}
+        >
+          ★ {cp.name}
+        </Chip>
+      ))}
     </div>
   );
 }
 
 /** The tall left screen: the face (or the creature) with its overlays. No title: it shows itself. */
-function LeftScreen() {
+function LeftScreen(props: {
+  customPresets: CustomVoicePreset[];
+  activePresetId: string | null;
+  onSelectPreset: (p: CustomVoicePreset) => void;
+  onClearCustom: () => void;
+}) {
   const mode = useStore((s) => s.mode);
   const threeD = useStore((s) => s.view.threeD);
   const bestiary = mode === "bestiary";
   const Face = threeD ? AnatomyView3D : AnatomyView;
   return (
-    <Screen className="left" focus lead={bestiary ? undefined : <BodyControl />} label={bestiary ? "Live creature airway" : "Live vocal tract"} tools={<ViewToggles />}>
+    <Screen
+      className="left"
+      focus
+      lead={
+        bestiary ? undefined : (
+          <BodyControl
+            customPresets={props.customPresets}
+            activePresetId={props.activePresetId}
+            onSelectPreset={props.onSelectPreset}
+            onClearCustom={props.onClearCustom}
+          />
+        )
+      }
+      label={bestiary ? "Live creature airway" : "Live vocal tract"}
+      tools={<ViewToggles />}
+    >
       <Suspense fallback={null}>
         {bestiary ? <CreatureView /> : mode === "speak" ? <Face slots={speechSlots} info={speechInfo} overlay={speechWords} /> : mode === "sing" ? <Face info={singInfo} overlay={singWords} /> : mode === "beatbox" ? <Face slots={beatSlots} info={beatInfo} showFormants={false} /> : <Face />}
       </Suspense>
@@ -185,6 +240,145 @@ function PlayRight() {
   );
 }
 
+function AddSynthModal(props: {
+  presets: CustomVoicePreset[];
+  onClose: () => void;
+  onUpdated: (list: CustomVoicePreset[], newest?: CustomVoicePreset) => void;
+}) {
+  const [name, setName] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const handleCreate = async () => {
+    if (!name.trim() || !file) {
+      setErr("신스 이름과 샘플 보이스 파일(WAV/MP3)을 모두 입력해 주세요.");
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      const b64 = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(new Error("파일을 읽지 못했습니다."));
+        reader.readAsDataURL(file);
+      });
+      const resp = await fetch("/api/voice-presets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: name.trim(), filename: file.name, audioBase64: b64 }),
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) {
+        setErr(data.error || "신스 생성에 실패했습니다.");
+        return;
+      }
+      setName("");
+      setFile(null);
+      props.onUpdated(data.presets || [], data.preset);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    const resp = await fetch(`/api/voice-presets/${encodeURIComponent(id)}`, { method: "DELETE" });
+    const data = await resp.json();
+    if (resp.ok && data.ok) {
+      props.onUpdated(data.presets || []);
+    }
+  };
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 100,
+        background: "rgba(0,0,0,0.78)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: "1rem",
+      }}
+    >
+      <div
+        style={{
+          background: "#070b14",
+          border: "1px solid rgba(90,200,255,0.45)",
+          borderRadius: "8px",
+          width: "100%",
+          maxWidth: "520px",
+          padding: "1.25rem",
+          color: "#d8f3ff",
+          display: "grid",
+          gap: "0.85rem",
+          fontSize: "0.85rem",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <strong style={{ fontSize: "1rem", color: "#38e8ff" }}>+ 새 커스텀 신스 추가 (샘플 보이스 분석)</strong>
+          <Chip on={false} onClick={props.onClose}>
+            ✕ Close
+          </Chip>
+        </div>
+
+        <label style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+          <span>신스 이름</span>
+          <input
+            type="text"
+            placeholder="예: CityPop Girl, Husky Male"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            disabled={busy}
+            style={{ background: "#03060d", color: "#fff", border: "1px solid rgba(90,200,255,0.35)", padding: "0.45rem 0.6rem", borderRadius: "4px" }}
+          />
+        </label>
+
+        <label style={{ display: "flex", flexDirection: "column", gap: "0.3rem" }}>
+          <span>샘플 보이스 파일 (WAV / MP3, 10~30초 클린 보컬 추천)</span>
+          <input
+            type="file"
+            accept="audio/*"
+            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+            disabled={busy}
+            style={{ color: "#9ae6ff" }}
+          />
+        </label>
+
+        <div style={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
+          <button className="primary" disabled={busy} onClick={() => void handleCreate()} style={{ padding: "0.45rem 1rem" }}>
+            {busy ? "보이스 분석 및 신스 생성 중..." : "분석 및 신스 추가"}
+          </button>
+          {err && <span style={{ color: "#ff6b81" }}>{err}</span>}
+        </div>
+
+        {props.presets.length > 0 && (
+          <div style={{ borderTop: "1px solid rgba(90,200,255,0.2)", paddingTop: "0.75rem", display: "grid", gap: "0.4rem" }}>
+            <span style={{ fontSize: "0.78rem", color: "#94a3b8" }}>저장된 커스텀 신스 (메인 화면 & Show 공용)</span>
+            {props.presets.map((p) => (
+              <div key={p.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", background: "#03060d", padding: "0.4rem 0.6rem", borderRadius: "4px" }}>
+                <div>
+                  <strong>★ {p.name}</strong>
+                  <span style={{ marginLeft: "0.5rem", fontSize: "0.75rem", color: "#7dd3fc" }}>
+                    {p.chimera_preset.cli_body} · {p.chimera_preset.play_voice.pitch_hz}Hz
+                  </span>
+                </div>
+                <Chip on={false} onClick={() => void handleDelete(p.id)}>
+                  삭제
+                </Chip>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function App() {
   const [show, setShow] = useState<string | null>(() => showId());
 
@@ -213,13 +407,53 @@ export function App() {
 
 function Wall(props: { onOpenShow: (id: string) => void }) {
   const mode = useStore((s) => s.mode);
+  const setBody = useStore((s) => s.setBody);
+  const setSource = useStore((s) => s.setSource);
+
+  const [customPresets, setCustomPresets] = useState<CustomVoicePreset[]>([]);
+  const [activePresetId, setActivePresetId] = useState<string | null>(null);
+  const [addSynthOpen, setAddSynthOpen] = useState(false);
+
+  useEffect(() => {
+    fetch("/api/voice-presets")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d?.presets) setCustomPresets(d.presets);
+      })
+      .catch(() => {});
+  }, []);
+
+  const applyCustomPreset = (p: CustomVoicePreset) => {
+    setActivePresetId(p.id);
+    const blend = p.chimera_preset.body_blend;
+    setBody({ female: blend.female, child: blend.child });
+    if (p.chimera_preset.play_voice?.pitch_hz) {
+      setSource({ f0: p.chimera_preset.play_voice.pitch_hz });
+    }
+  };
+
   return (
     <div className={`app text-colors mode-${mode}`}>
-      <TopBar onOpenShow={props.onOpenShow} />
+      <TopBar onOpenShow={props.onOpenShow} onOpenAddSynth={() => setAddSynthOpen(true)} />
       <main className={`wall wall-${mode}`}>
-        <LeftScreen />
+        <LeftScreen
+          customPresets={customPresets}
+          activePresetId={activePresetId}
+          onSelectPreset={applyCustomPreset}
+          onClearCustom={() => setActivePresetId(null)}
+        />
         {mode === "play" ? <PlayRight /> : mode === "speak" ? <SpeakRight /> : mode === "sing" ? <SingRight /> : mode === "beatbox" ? <BeatboxRight /> : <BestiaryRight />}
       </main>
+      {addSynthOpen && (
+        <AddSynthModal
+          presets={customPresets}
+          onClose={() => setAddSynthOpen(false)}
+          onUpdated={(list, newest) => {
+            setCustomPresets(list);
+            if (newest) applyCustomPreset(newest);
+          }}
+        />
+      )}
     </div>
   );
 }

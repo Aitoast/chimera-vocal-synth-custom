@@ -14,6 +14,21 @@ interface JobState {
   error: string | null;
 }
 
+function readPresets(presetsPath: string): any[] {
+  if (!fs.existsSync(presetsPath)) return [];
+  try {
+    const data = JSON.parse(fs.readFileSync(presetsPath, "utf-8"));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+function writePresets(presetsPath: string, list: any[]): void {
+  fs.mkdirSync(path.dirname(presetsPath), { recursive: true });
+  fs.writeFileSync(presetsPath, JSON.stringify(list, null, 2), "utf-8");
+}
+
 function autoShowPlugin(): Plugin {
   let job: JobState = {
     running: false,
@@ -28,11 +43,149 @@ function autoShowPlugin(): Plugin {
   return {
     name: "chimera-auto-show-api",
     configureServer(server) {
+      const presetsPath = path.resolve(process.cwd(), "public/presets/voices.json");
+
+      // GET / POST / DELETE /api/voice-presets — manage custom tuned synth voices
+      server.middlewares.use("/api/voice-presets", (req, res, next) => {
+        const subPath = (req.url || "").split("?")[0].replace(/^\/+/, "");
+
+        if (req.method === "GET" && !subPath) {
+          res.setHeader("Content-Type", "application/json; charset=utf-8");
+          res.end(JSON.stringify({ presets: readPresets(presetsPath) }));
+          return;
+        }
+
+        if (req.method === "DELETE" && subPath) {
+          if (!/^[\w-]+$/.test(subPath)) {
+            res.statusCode = 400;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({ ok: false, error: "잘못된 프리셋 ID입니다." }));
+            return;
+          }
+          const nextList = readPresets(presetsPath).filter((p) => p.id !== subPath);
+          writePresets(presetsPath, nextList);
+          res.setHeader("Content-Type", "application/json; charset=utf-8");
+          res.end(JSON.stringify({ ok: true, id: subPath, presets: nextList }));
+          return;
+        }
+
+        if (req.method === "POST" && !subPath) {
+          const chunks: Buffer[] = [];
+          req.on("data", (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+          req.on("end", () => {
+            try {
+              const body = JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}");
+              const name = String(body.name || "").trim();
+              const audioBase64 = String(body.audioBase64 || "").trim();
+              const filename = String(body.filename || "sample.wav").replace(/[^a-zA-Z0-9._-]/g, "_");
+              const audioPathInput = String(body.audioPath || "").trim();
+
+              if (!name) {
+                res.statusCode = 400;
+                res.setHeader("Content-Type", "application/json; charset=utf-8");
+                res.end(JSON.stringify({ ok: false, error: "신스 이름을 입력해 주세요." }));
+                return;
+              }
+              if (!audioBase64 && !audioPathInput) {
+                res.statusCode = 400;
+                res.setHeader("Content-Type", "application/json; charset=utf-8");
+                res.end(JSON.stringify({ ok: false, error: "샘플 보이스 파일(WAV/MP3)을 선택해 주세요." }));
+                return;
+              }
+
+              const slug =
+                name
+                  .toLowerCase()
+                  .replace(/[^a-z0-9]+/g, "_")
+                  .replace(/^_|_$/g, "") || `synth_${Date.now().toString(36)}`;
+              const id = `custom_${slug}_${Date.now().toString(36).slice(-4)}`;
+
+              const sampleDir = path.resolve(process.cwd(), "_auto_work/preset_samples");
+              fs.mkdirSync(sampleDir, { recursive: true });
+
+              let samplePath = audioPathInput;
+              if (audioBase64) {
+                const rawB64 = audioBase64.includes(",") ? audioBase64.split(",")[1] : audioBase64;
+                samplePath = path.join(sampleDir, `${id}_${filename}`);
+                fs.writeFileSync(samplePath, Buffer.from(rawB64, "base64"));
+              }
+
+              const outJsonPath = path.join(sampleDir, `${id}_preset.json`);
+              const pyArgs = ["-u", "tune_voice.py", "--audio", samplePath, "--out", outJsonPath, "--compare-chimera"];
+
+              const runTuner = (exe: string, triedFallback: boolean) => {
+                let logs = "";
+                const child = spawn(exe, pyArgs, {
+                  cwd: process.cwd(),
+                  env: { ...process.env, PYTHONUTF8: "1", PYTHONUNBUFFERED: "1" },
+                });
+                child.stdout.on("data", (d) => {
+                  const s = d.toString("utf-8");
+                  process.stdout.write(s);
+                  logs += s;
+                });
+                child.stderr.on("data", (d) => {
+                  const s = d.toString("utf-8");
+                  process.stderr.write(s);
+                  logs += s;
+                });
+                child.on("error", (err: NodeJS.ErrnoException) => {
+                  if (!triedFallback && err.code === "ENOENT" && exe === "python") {
+                    return runTuner("py", true);
+                  }
+                  res.statusCode = 500;
+                  res.setHeader("Content-Type", "application/json; charset=utf-8");
+                  res.end(JSON.stringify({ ok: false, error: `Python 실행 실패: ${err.message}`, log: logs }));
+                });
+                child.on("close", (code) => {
+                  res.setHeader("Content-Type", "application/json; charset=utf-8");
+                  if (code !== 0 || !fs.existsSync(outJsonPath)) {
+                    res.statusCode = 500;
+                    res.end(
+                      JSON.stringify({
+                        ok: false,
+                        error: `보이스 분석 실패 (code ${code})`,
+                        log: logs,
+                      })
+                    );
+                    return;
+                  }
+                  try {
+                    const tuned = JSON.parse(fs.readFileSync(outJsonPath, "utf-8"));
+                    const preset = {
+                      id,
+                      name,
+                      acoustics: tuned.acoustics,
+                      chimera_preset: tuned.chimera_preset,
+                    };
+                    const list = readPresets(presetsPath);
+                    list.push(preset);
+                    writePresets(presetsPath, list);
+                    res.end(JSON.stringify({ ok: true, preset, presets: list }));
+                  } catch (e) {
+                    res.statusCode = 500;
+                    res.end(JSON.stringify({ ok: false, error: String(e), log: logs }));
+                  }
+                });
+              };
+
+              runTuner("python", false);
+            } catch (err) {
+              res.statusCode = 400;
+              res.setHeader("Content-Type", "application/json; charset=utf-8");
+              res.end(JSON.stringify({ ok: false, error: String(err) }));
+            }
+          });
+          return;
+        }
+
+        return next();
+      });
+
       // GET /api/shows & DELETE /api/shows/:id
       server.middlewares.use("/api/shows", (req, res, next) => {
         const subPath = (req.url || "").split("?")[0].replace(/^\/+/, "");
 
-        // DELETE /api/shows/<id> — remove public/shows/<id> and _auto_work/<id>
         if (req.method === "DELETE" && subPath) {
           if (!/^[\w-]+$/.test(subPath)) {
             res.statusCode = 400;
@@ -57,7 +210,6 @@ function autoShowPlugin(): Plugin {
           return;
         }
 
-        // GET /api/shows — list all available shows under public/shows/
         if (req.method !== "GET" || subPath) return next();
         try {
           const root = path.resolve(process.cwd(), "public/shows");

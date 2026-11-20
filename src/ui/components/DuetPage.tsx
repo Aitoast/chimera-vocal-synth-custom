@@ -40,6 +40,12 @@ interface ShowSummary {
   title: string;
 }
 
+interface CustomPresetSummary {
+  id: string;
+  name: string;
+  chimera_preset?: { cli_body?: string };
+}
+
 const VIEW: ViewFlags = { pressure: true, particles: true, grid: false, calipers: false };
 
 async function fetchOk(url: string): Promise<Response> {
@@ -54,6 +60,7 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
   const [activeId, setActiveId] = useState(props.id);
   const [reloadNonce, setReloadNonce] = useState(0);
   const [showList, setShowList] = useState<ShowSummary[]>([]);
+  const [customSynths, setCustomSynths] = useState<CustomPresetSummary[]>([]);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
@@ -62,7 +69,7 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
   const [sourceInput, setSourceInput] = useState("");
   const [titleInput, setTitleInput] = useState("");
   const [idInput, setIdInput] = useState("");
-  const [langInput, setLangInput] = useState<"auto" | "en" | "ko">("auto");
+  const [langInput, setLangInput] = useState<"auto" | "en" | "ko" | "ja">("auto");
   const [selectedVoices, setSelectedVoices] = useState<string[]>(["male", "female", "child"]);
   const [assignMode, setAssignMode] = useState<"alternate" | "register">("alternate");
   const [maxSecInput, setMaxSecInput] = useState(""); // empty = full video length
@@ -95,6 +102,12 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
 
   useEffect(() => {
     void refreshShowList();
+    fetch("/api/voice-presets")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (d?.presets) setCustomSynths(d.presets);
+      })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -402,6 +415,11 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
                   {v.toUpperCase()}
                 </Chip>
               ))}
+              {customSynths.map((cs) => (
+                <Chip key={cs.id} on={selectedVoices.includes(cs.id)} onClick={() => !generating && toggleVoice(cs.id)}>
+                  ★ {cs.name}
+                </Chip>
+              ))}
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
               <span>배정:</span>
@@ -414,7 +432,7 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
               <span>언어:</span>
-              {(["auto", "en", "ko"] as const).map((lg) => (
+              {(["auto", "en", "ko", "ja"] as const).map((lg) => (
                 <Chip key={lg} on={langInput === lg} onClick={() => !generating && setLangInput(lg)}>
                   {lg === "auto" ? "자동" : lg.toUpperCase()}
                 </Chip>

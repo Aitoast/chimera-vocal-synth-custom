@@ -1,0 +1,51 @@
+[
+  {
+    "id": "custom_synth_mwoztnwf_tnwf",
+    "name": "우사기",
+    "acoustics": {
+      "median_f0_hz": 378.6,
+      "median_midi": 66.4,
+      "f0_range_hz": [
+        282,
+        460.8
+      ],
+      "bands_db": {
+        "80_500hz": 17.3,
+        "500_2000hz": 13.4,
+        "2000_4000hz": 12.6,
+        "4000_8000hz": 7.1
+      },
+      "jitter_semitones": 0.1,
+      "spectral_flatness": 0.0071
+    },
+    "chimera_preset": {
+      "cli_body": "child",
+      "body_blend": {
+        "male": 0.15,
+        "female": 0.41,
+        "child": 0.85
+      },
+      "play_voice": {
+        "pitch_hz": 378.6,
+        "pressed_pct": 51,
+        "vibrato_cents": 79
+      },
+      "play_tone": {
+        "breathy_pct": 62,
+        "rough_pct": 22,
+        "fry_pct": 0
+      },
+      "play_throat_larynx": {
+        "larynx_pct": 81,
+        "twang_pct": 59
+      },
+      "sing_encoders": {
+        "vibrato_depth_cents": 79,
+        "vibrato_rate_hz": 5.56,
+        "breathy_pct": 62,
+        "ring_pct": 38
+      },
+      "cli_body_by_timbre": "female"
+    }
+  }
+]
