@@ -28,9 +28,37 @@ function autoShowPlugin(): Plugin {
   return {
     name: "chimera-auto-show-api",
     configureServer(server) {
-      // GET /api/shows — list all available shows under public/shows/
+      // GET /api/shows & DELETE /api/shows/:id
       server.middlewares.use("/api/shows", (req, res, next) => {
-        if (req.method !== "GET") return next();
+        const subPath = (req.url || "").split("?")[0].replace(/^\/+/, "");
+
+        // DELETE /api/shows/<id> — remove public/shows/<id> and _auto_work/<id>
+        if (req.method === "DELETE" && subPath) {
+          if (!/^[\w-]+$/.test(subPath)) {
+            res.statusCode = 400;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({ ok: false, error: "잘못된 쇼 ID입니다." }));
+            return;
+          }
+          try {
+            const showDir = path.resolve(process.cwd(), "public/shows", subPath);
+            const workDir = path.resolve(process.cwd(), "_auto_work", subPath);
+            const workLyrics = path.resolve(process.cwd(), "_auto_work", `${subPath}_lyrics.txt`);
+            if (fs.existsSync(showDir)) fs.rmSync(showDir, { recursive: true, force: true });
+            if (fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true });
+            if (fs.existsSync(workLyrics)) fs.rmSync(workLyrics, { force: true });
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({ ok: true, id: subPath }));
+          } catch (err) {
+            res.statusCode = 500;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+          }
+          return;
+        }
+
+        // GET /api/shows — list all available shows under public/shows/
+        if (req.method !== "GET" || subPath) return next();
         try {
           const root = path.resolve(process.cwd(), "public/shows");
           const shows: { id: string; title: string }[] = [];
@@ -63,7 +91,7 @@ function autoShowPlugin(): Plugin {
         res.end(JSON.stringify(job));
       });
 
-      // POST /api/generate-show — start auto_show.py asynchronously and stream logs
+      // POST /api/generate-show — start auto_show.py (lyrics optional; Whisper auto-transcribes)
       server.middlewares.use("/api/generate-show", (req, res, next) => {
         if (req.method !== "POST") return next();
         let raw = "";
@@ -82,6 +110,7 @@ function autoShowPlugin(): Plugin {
             const body = JSON.parse(raw || "{}");
             const source = String(body.source || "").trim();
             const lyrics = String(body.lyrics || "").trim();
+            const lang = String(body.lang || "auto").trim();
             const voices = String(body.voices || "male,female,child").trim();
             const mode = body.mode === "register" ? "register" : "alternate";
             const maxSec = Number(body.maxSec || 0);
@@ -89,17 +118,12 @@ function autoShowPlugin(): Plugin {
             const rawId = String(body.id || "").trim().replace(/[^a-zA-Z0-9_-]/g, "");
             const id = rawId || `show_${Date.now().toString(36)}`;
 
-            if (!source || !lyrics) {
+            if (!source) {
               res.statusCode = 400;
               res.setHeader("Content-Type", "application/json; charset=utf-8");
-              res.end(JSON.stringify({ ok: false, error: "URL(또는 오디오 경로)과 가사를 모두 입력해 주세요." }));
+              res.end(JSON.stringify({ ok: false, error: "유튜브 URL(또는 로컬 오디오 경로)을 입력해 주세요." }));
               return;
             }
-
-            const workDir = path.resolve(process.cwd(), "_auto_work");
-            fs.mkdirSync(workDir, { recursive: true });
-            const lyricsPath = path.join(workDir, `${id}_lyrics.txt`);
-            fs.writeFileSync(lyricsPath, lyrics, "utf-8");
 
             const isUrl = /^https?:\/\//i.test(source);
             const scriptArgs = [
@@ -107,15 +131,23 @@ function autoShowPlugin(): Plugin {
               "auto_show.py",
               isUrl ? "--url" : "--audio",
               source,
-              "--lyrics",
-              lyricsPath,
               "--id",
               id,
               "--voices",
               voices,
               "--mode",
               mode,
+              "--lang",
+              lang || "auto",
             ];
+
+            if (lyrics) {
+              const workDir = path.resolve(process.cwd(), "_auto_work");
+              fs.mkdirSync(workDir, { recursive: true });
+              const lyricsPath = path.join(workDir, `${id}_lyrics.txt`);
+              fs.writeFileSync(lyricsPath, lyrics, "utf-8");
+              scriptArgs.push("--lyrics", lyricsPath);
+            }
             if (title) scriptArgs.push("--title", title);
             if (maxSec > 0) scriptArgs.push("--max-sec", String(maxSec));
 

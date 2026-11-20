@@ -1,0 +1,13 @@
+# CHIMERA Auto-Show Pipeline Python dependencies
+# Install: pip install -r requirements.txt
+# System prerequisites (install separately):
+#   - Rust + wasm32-unknown-unknown target (`rustup target add wasm32-unknown-unknown`)
+#   - Bun (`powershell -c "irm bun.sh/install.ps1|iex"`)
+#   - FFmpeg (`winget install -e --id Gyan.FFmpeg -s winget`)
+
+yt-dlp>=2025.1.0
+demucs>=4.0.1
+librosa>=0.10.2
+soundfile>=0.12.1
+numpy>=1.26.0
+faster-whisper>=1.1.0

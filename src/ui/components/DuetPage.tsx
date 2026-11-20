@@ -1,10 +1,9 @@
 /**
  * The duet page (`?show=<id>`): a pre-rendered song with two (or more) voices, each on its own 3D
- * head, side by side, moving exactly as the engine did when it sang. Nothing is synthesized here:
- * the page plays the mixed track and replays each voice's recorded telemetry at the playhead.
+ * head, side by side, moving exactly as the engine did when it sang.
  *
- * Includes a built-in Auto-Show drawer (`+ New Show`) with live step & log streaming from
- * `/api/generate-show` + `/api/generate-status`.
+ * Includes `+ New Show` (auto Whisper lyrics + full video length default) and a 2-step `Delete`
+ * button to clean up unwanted shows directly from the Show UI.
  */
 import { useEffect, useRef, useState } from "react";
 import { AnatomyView3D, type HeadFeed } from "./AnatomyView3D.tsx";
@@ -55,16 +54,21 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
   const [activeId, setActiveId] = useState(props.id);
   const [reloadNonce, setReloadNonce] = useState(0);
   const [showList, setShowList] = useState<ShowSummary[]>([]);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
-  // Generator modal state
+  // Streamlined Auto-Show panel state (default: full video length + auto Whisper lyrics)
   const [composerOpen, setComposerOpen] = useState(false);
   const [sourceInput, setSourceInput] = useState("");
   const [titleInput, setTitleInput] = useState("");
   const [idInput, setIdInput] = useState("");
-  const [lyricsInput, setLyricsInput] = useState("");
+  const [langInput, setLangInput] = useState<"auto" | "en" | "ko">("auto");
   const [selectedVoices, setSelectedVoices] = useState<string[]>(["male", "female", "child"]);
   const [assignMode, setAssignMode] = useState<"alternate" | "register">("alternate");
-  const [maxSecInput, setMaxSecInput] = useState("0");
+  const [maxSecInput, setMaxSecInput] = useState(""); // empty = full video length
+  const [showManualLyrics, setShowManualLyrics] = useState(false);
+  const [lyricsInput, setLyricsInput] = useState("");
+
   const [generating, setGenerating] = useState(false);
   const [genStep, setGenStep] = useState<string>("");
   const [genError, setGenError] = useState<string | null>(null);
@@ -73,19 +77,24 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
 
   useEffect(() => {
     setActiveId(props.id);
+    setConfirmDelete(false);
   }, [props.id]);
 
-  const refreshShowList = () => {
-    fetch("/api/shows")
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => {
-        if (d?.shows) setShowList(d.shows);
-      })
-      .catch(() => {});
+  const refreshShowList = async (): Promise<ShowSummary[]> => {
+    try {
+      const r = await fetch("/api/shows");
+      if (!r.ok) return [];
+      const d = await r.json();
+      const list = Array.isArray(d?.shows) ? (d.shows as ShowSummary[]) : [];
+      setShowList(list);
+      return list;
+    } catch {
+      return [];
+    }
   };
 
   useEffect(() => {
-    refreshShowList();
+    void refreshShowList();
   }, []);
 
   useEffect(() => {
@@ -94,7 +103,6 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
     }
   }, [genLog]);
 
-  // Poll /api/generate-status while generating
   useEffect(() => {
     if (!generating) return;
     let alive = true;
@@ -108,7 +116,7 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
         if (st.done) {
           setGenerating(false);
           if (st.ok) {
-            refreshShowList();
+            await refreshShowList();
             setComposerOpen(false);
             switchShow(st.id);
             setReloadNonce((n) => n + 1);
@@ -129,6 +137,7 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
   }, [generating]);
 
   const switchShow = (nextId: string) => {
+    setConfirmDelete(false);
     setActiveId(nextId);
     const url = new URL(window.location.href);
     url.searchParams.set("show", nextId);
@@ -195,6 +204,34 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
     };
   }, [transport]);
 
+  const handleDeleteCurrent = async () => {
+    if (!activeId || deleting) return;
+    setDeleting(true);
+    try {
+      transport?.pause();
+      const resp = await fetch(`/api/shows/${encodeURIComponent(activeId)}`, { method: "DELETE" });
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) {
+        setError(data.error || "삭제에 실패했습니다.");
+        return;
+      }
+      setConfirmDelete(false);
+      const remaining = await refreshShowList();
+      if (remaining.length > 0) {
+        switchShow(remaining[0].id);
+        setReloadNonce((n) => n + 1);
+      } else {
+        setLoaded(null);
+        setError("저장된 쇼가 없습니다. 우측 상단 '+ New Show'로 새 곡을 만들어 주세요.");
+        setComposerOpen(true);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   const toggleVoice = (v: string) => {
     setSelectedVoices((prev) => {
       if (prev.includes(v)) {
@@ -205,8 +242,8 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
   };
 
   const handleGenerate = async () => {
-    if (!sourceInput.trim() || !lyricsInput.trim()) {
-      setGenError("유튜브 URL(또는 로컬 오디오 경로)과 가사를 모두 입력해 주세요.");
+    if (!sourceInput.trim()) {
+      setGenError("유튜브 URL(또는 로컬 오디오 경로)을 입력해 주세요.");
       return;
     }
     setGenError(null);
@@ -220,10 +257,11 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
           source: sourceInput.trim(),
           title: titleInput.trim(),
           id: idInput.trim(),
-          lyrics: lyricsInput.trim(),
+          lang: langInput,
+          lyrics: showManualLyrics ? lyricsInput.trim() : "",
           voices: selectedVoices.join(","),
           mode: assignMode,
-          maxSec: Number(maxSecInput) || 0,
+          maxSec: maxSecInput.trim() ? Number(maxSecInput) || 0 : 0,
         }),
       });
       const data = await resp.json();
@@ -238,7 +276,8 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
   };
 
   const st = transport?.state ?? { playing: false, time: 0, duration: 0, epoch: 0 };
-  const title = loaded?.show.title ?? (error ? "Show Error" : "Loading…");
+  const title = loaded?.show.title ?? (error ? "Show" : "Loading…");
+  const canDelete = showList.some((s) => s.id === activeId);
 
   return (
     <div className="duet">
@@ -250,7 +289,7 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
         )}
         <span className="wordmark">Chimera</span>
         <span className="duet-title">{title}</span>
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "0.5rem" }}>
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}>
           {showList.length > 0 && (
             <select
               aria-label="Select Show"
@@ -273,6 +312,33 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
               ))}
             </select>
           )}
+          {canDelete && !confirmDelete && (
+            <Chip on={false} onClick={() => setConfirmDelete(true)}>
+              🗑 Delete
+            </Chip>
+          )}
+          {canDelete && confirmDelete && (
+            <>
+              <button
+                disabled={deleting}
+                onClick={() => void handleDeleteCurrent()}
+                style={{
+                  background: "#991b1b",
+                  color: "#fff",
+                  border: "1px solid #f87171",
+                  borderRadius: "4px",
+                  padding: "0.25rem 0.6rem",
+                  fontSize: "0.75rem",
+                  cursor: "pointer",
+                }}
+              >
+                {deleting ? "삭제 중..." : "삭제 확인"}
+              </button>
+              <Chip on={false} onClick={() => setConfirmDelete(false)}>
+                취소
+              </Chip>
+            </>
+          )}
           <Chip on={composerOpen} onClick={() => setComposerOpen((v) => !v)}>
             {composerOpen ? "✕ Close" : "+ New Show"}
           </Chip>
@@ -291,9 +357,9 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
             fontSize: "0.85rem",
           }}
         >
-          <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr", gap: "0.6rem" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "2.2fr 1fr 1fr", gap: "0.6rem" }}>
             <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
-              <span>YouTube URL 또는 로컬 MP3/WAV 경로</span>
+              <span>YouTube URL 또는 로컬 MP3/WAV 경로 (가사 자동 추출)</span>
               <input
                 type="text"
                 placeholder="https://www.youtube.com/watch?v=... 또는 C:\path\song.mp3"
@@ -307,7 +373,7 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
               <span>곡 제목 (선택)</span>
               <input
                 type="text"
-                placeholder="예: My Trio Song"
+                placeholder="예: Mr. Sandman"
                 value={titleInput}
                 onChange={(e) => setTitleInput(e.target.value)}
                 disabled={generating}
@@ -315,10 +381,11 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
               />
             </label>
             <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
-              <span>테스트 길이(초, 0=전체)</span>
+              <span>길이 제한(초 · 비우면 전체)</span>
               <input
                 type="number"
                 min={0}
+                placeholder="전체 영상 길이"
                 value={maxSecInput}
                 onChange={(e) => setMaxSecInput(e.target.value)}
                 disabled={generating}
@@ -329,7 +396,7 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
 
           <div style={{ display: "flex", alignItems: "center", gap: "1rem", flexWrap: "wrap" }}>
             <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
-              <span>보이스 선택:</span>
+              <span>보이스:</span>
               {(["male", "female", "child"] as const).map((v) => (
                 <Chip key={v} on={selectedVoices.includes(v)} onClick={() => !generating && toggleVoice(v)}>
                   {v.toUpperCase()}
@@ -337,38 +404,51 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
               ))}
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
-              <span>파트 배정:</span>
+              <span>배정:</span>
               <Chip on={assignMode === "alternate"} onClick={() => !generating && setAssignMode("alternate")}>
-                교대(Alternate)
+                교대
               </Chip>
               <Chip on={assignMode === "register"} onClick={() => !generating && setAssignMode("register")}>
-                음역대별(Register)
+                음역대별
               </Chip>
             </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
+              <span>언어:</span>
+              {(["auto", "en", "ko"] as const).map((lg) => (
+                <Chip key={lg} on={langInput === lg} onClick={() => !generating && setLangInput(lg)}>
+                  {lg === "auto" ? "자동" : lg.toUpperCase()}
+                </Chip>
+              ))}
+            </div>
             <label style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>
-              <span>폴더 ID(선택):</span>
+              <span>ID(선택):</span>
               <input
                 type="text"
                 placeholder="자동 생성"
                 value={idInput}
                 onChange={(e) => setIdInput(e.target.value)}
                 disabled={generating}
-                style={{ width: "120px", background: "#03060d", color: "#fff", border: "1px solid rgba(90,200,255,0.35)", padding: "0.25rem 0.5rem", borderRadius: "4px" }}
+                style={{ width: "110px", background: "#03060d", color: "#fff", border: "1px solid rgba(90,200,255,0.35)", padding: "0.25rem 0.5rem", borderRadius: "4px" }}
               />
             </label>
+            <Chip on={showManualLyrics} onClick={() => !generating && setShowManualLyrics((v) => !v)}>
+              {showManualLyrics ? "자동 가사 사용" : "수동 가사 입력"}
+            </Chip>
           </div>
 
-          <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
-            <span>가사 입력 (한 줄씩 프레이즈 구분 — 한글/영어 모두 지원)</span>
-            <textarea
-              rows={5}
-              placeholder={"가사를 한 줄씩 붙여 넣어 주세요...\n(줄 단위로 선택한 보이스들에게 자동 분배됩니다)"}
-              value={lyricsInput}
-              onChange={(e) => setLyricsInput(e.target.value)}
-              disabled={generating}
-              style={{ background: "#03060d", color: "#fff", border: "1px solid rgba(90,200,255,0.35)", padding: "0.5rem 0.6rem", borderRadius: "4px", fontFamily: "inherit" }}
-            />
-          </label>
+          {showManualLyrics && (
+            <label style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
+              <span>수동 가사 입력 (입력 시 Whisper 대신 이 가사 사용)</span>
+              <textarea
+                rows={4}
+                placeholder="가사를 한 줄씩 입력..."
+                value={lyricsInput}
+                onChange={(e) => setLyricsInput(e.target.value)}
+                disabled={generating}
+                style={{ background: "#03060d", color: "#fff", border: "1px solid rgba(90,200,255,0.35)", padding: "0.5rem 0.6rem", borderRadius: "4px", fontFamily: "inherit" }}
+              />
+            </label>
+          )}
 
           <div style={{ display: "flex", alignItems: "center", gap: "0.75rem", flexWrap: "wrap" }}>
             <button className="primary" disabled={generating} onClick={() => void handleGenerate()} style={{ padding: "0.5rem 1.2rem" }}>
