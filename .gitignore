@@ -8,3 +8,11 @@ src/wasm/chimera.wasm
 
 # duet shows (?show=<id>) are made locally and are never published: often covers of songs we have no rights to
 public/shows/
+
+_auto_work/
+*.wav
+*.mp3
+sandman_*.json
+twinkle_kr.json
+mix_sandman.ts
+make_sandman_show.ts

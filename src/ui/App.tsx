@@ -23,7 +23,7 @@ import { presetOf, PRESETS } from "./body.ts";
 
 // three.js only loads when the 3D view is first shown
 const AnatomyView3D = lazy(() => import("./components/AnatomyView3D.tsx").then((m) => ({ default: m.AnatomyView3D })));
-// the duet page (`?show=<id>`): two 3D heads replaying a pre-rendered song
+// the duet page (`?show=<id>`): two (or more) 3D heads replaying a pre-rendered song
 const DuetPage = lazy(() => import("./components/DuetPage.tsx").then((m) => ({ default: m.DuetPage })));
 
 /** the show to play, from `?show=<id>` (a plain folder name under public/shows) */
@@ -32,7 +32,7 @@ function showId(): string | null {
   return id && /^[\w-]+$/.test(id) ? id : null;
 }
 
-function TopBar() {
+function TopBar(props: { onOpenShow: (id: string) => void }) {
   const started = useStore((s) => s.started);
   const volume = useStore((s) => s.volume);
   const setVolume = useStore((s) => s.setVolume);
@@ -50,18 +50,23 @@ function TopBar() {
         <span className="wordmark">Chimera</span>
         <span className="tagline">A voice grown from a simulated airway</span>
       </div>
-      <Segmented<Mode>
-        label="Mode"
-        value={mode}
-        onChange={setMode}
-        options={[
-          { value: "play", label: "Play" },
-          { value: "speak", label: "Speak" },
-          { value: "sing", label: "Sing" },
-          { value: "bestiary", label: "Bestiary" },
-          { value: "beatbox", label: "Beatbox" },
-        ]}
-      />
+      <div style={{ display: "flex", alignItems: "center", gap: "0.5rem" }}>
+        <Segmented<Mode>
+          label="Mode"
+          value={mode}
+          onChange={setMode}
+          options={[
+            { value: "play", label: "Play" },
+            { value: "speak", label: "Speak" },
+            { value: "sing", label: "Sing" },
+            { value: "bestiary", label: "Bestiary" },
+            { value: "beatbox", label: "Beatbox" },
+          ]}
+        />
+        <Chip on={false} onClick={() => props.onOpenShow("sandman")}>
+          Show
+        </Chip>
+      </div>
       <div className="topbar-right">
         <label className="volume">
           <span>Volume</span>
@@ -181,21 +186,36 @@ function PlayRight() {
 }
 
 export function App() {
-  const show = showId();
+  const [show, setShow] = useState<string | null>(() => showId());
+
+  useEffect(() => {
+    const onPop = () => setShow(showId());
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  const openShow = (id: string | null) => {
+    const url = new URL(window.location.href);
+    if (id) url.searchParams.set("show", id);
+    else url.searchParams.delete("show");
+    window.history.pushState(null, "", url.toString());
+    setShow(id);
+  };
+
   if (show)
     return (
       <Suspense fallback={null}>
-        <DuetPage id={show} />
+        <DuetPage id={show} onBack={() => openShow(null)} />
       </Suspense>
     );
-  return <Wall />;
+  return <Wall onOpenShow={openShow} />;
 }
 
-function Wall() {
+function Wall(props: { onOpenShow: (id: string) => void }) {
   const mode = useStore((s) => s.mode);
   return (
     <div className={`app text-colors mode-${mode}`}>
-      <TopBar />
+      <TopBar onOpenShow={props.onOpenShow} />
       <main className={`wall wall-${mode}`}>
         <LeftScreen />
         {mode === "play" ? <PlayRight /> : mode === "speak" ? <SpeakRight /> : mode === "sing" ? <SingRight /> : mode === "beatbox" ? <BeatboxRight /> : <BestiaryRight />}
