@@ -71,7 +71,7 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
   const [idInput, setIdInput] = useState("");
   const [langInput, setLangInput] = useState<"auto" | "en" | "ko" | "ja">("auto");
   const [selectedVoices, setSelectedVoices] = useState<string[]>(["male", "female", "child"]);
-  const [assignMode, setAssignMode] = useState<"alternate" | "register">("alternate");
+  const [assignMode, setAssignMode] = useState<"alternate" | "register" | "harmony">("harmony");
   const [maxSecInput, setMaxSecInput] = useState(""); // empty = full video length
   const [showManualLyrics, setShowManualLyrics] = useState(false);
   const [lyricsInput, setLyricsInput] = useState("");
@@ -428,6 +428,9 @@ export function DuetPage(props: { id: string; onBack?: () => void }) {
               </Chip>
               <Chip on={assignMode === "register"} onClick={() => !generating && setAssignMode("register")}>
                 음역대별
+              </Chip>
+              <Chip on={assignMode === "harmony"} onClick={() => !generating && setAssignMode("harmony")}>
+                합창(Harmony)
               </Chip>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: "0.4rem" }}>

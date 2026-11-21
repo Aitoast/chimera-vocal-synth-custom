@@ -1,31 +1,22 @@
 #!/usr/bin/env python3
 """
-CHIMERA Voice Preset Tuner (tune_voice.py)
-------------------------------------------
-Analyzes a target vocal sample (WAV/MP3, e.g. a Demucs-separated vocals.wav or a
-10-30s clean voice recording) and computes the closest CHIMERA physical-modeling
-parameters:
-  - Continuous Body blend (male / female / child)
-  - Pitch register (median F0 Hz & MIDI)
-  - Spectral tilt & brightness -> pressed, twang, larynx
-  - High-frequency noise & pitch jitter -> breathy, rough, fry
-  - Sustained-note F0 modulation -> vibrato rate (Hz) & depth (cents)
-
-Optionally compares the target sample's MFCC timbre against CHIMERA's own
-`chimera.exe render vowels` outputs to verify the best base body preset!
-
-Usage:
-  python tune_voice.py --audio vocals.wav
-  python tune_voice.py --audio vocals.wav --out my_preset.json --compare-chimera
+CHIMERA Voice Preset Tuner v2 (tune_voice.py)
+---------------------------------------------
+Analyzes a target vocal sample (WAV/MP3) using:
+  - pYIN pitch tracking (up to C7 for bright/anime/character voices)
+  - LPC Formant estimation (F1, F2, F3) to measure true Vocal Tract Length (VTL)
+  - Spectral band balance, flatness, and F0 jitter for breathiness, tension, roughness, twang, pressure
+  - Sustained-note vibrato rate & depth estimation
+  - Optional MFCC distance comparison against CHIMERA's own `render vowels`
+Outputs exact CHIMERA Web UI dial values AND a `source` block directly readable by `chimera.exe render notes`.
 """
 
 import argparse
 import json
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import librosa
 import numpy as np
@@ -45,6 +36,48 @@ def find_chimera_exe(repo_root: Path) -> Optional[Path]:
     return None
 
 
+def estimate_lpc_formants(y: np.ndarray, sr: int, valid_frames: np.ndarray, hop: int) -> Tuple[float, float, float]:
+    """Estimates median F1, F2, F3 (Hz) via LPC roots on voiced frames."""
+    # Downsample to 10 kHz for clean vocal-tract LPC (order 12)
+    sr_lpc = 10000
+    y_ds = librosa.resample(y, orig_sr=sr, target_sr=sr_lpc)
+    # Pre-emphasis filter
+    y_pe = np.append(y_ds[0], y_ds[1:] - 0.97 * y_ds[:-1])
+    hop_ds = int(round(hop * sr_lpc / sr))
+    win = int(0.032 * sr_lpc)
+
+    f1s, f2s, f3s = [], [], []
+    voiced_indices = np.where(valid_frames)[0]
+    step = max(1, len(voiced_indices) // 60)  # sample up to ~60 voiced frames
+
+    for idx in voiced_indices[::step]:
+        c = idx * hop_ds
+        if c + win > len(y_pe):
+            break
+        frame = y_pe[c : c + win] * np.hamming(win)
+        if np.max(np.abs(frame)) < 1e-4:
+            continue
+        try:
+            a = librosa.lpc(frame, order=12)
+            roots = np.roots(a)
+            roots = roots[np.imag(roots) >= 0.01]
+            angs = np.arctan2(np.imag(roots), np.real(roots))
+            freqs = angs * (sr_lpc / (2.0 * np.pi))
+            bws = -0.5 * (sr_lpc / (2.0 * np.pi)) * np.log(np.abs(roots) + 1e-12)
+            formants = sorted(f for f, bw in zip(freqs, bws) if 220 < f < 4200 and bw < 500)
+            if len(formants) >= 3:
+                f1s.append(formants[0])
+                f2s.append(formants[1])
+                f3s.append(formants[2])
+        except Exception:
+            continue
+
+    f1 = float(np.median(f1s)) if f1s else 550.0
+    f2 = float(np.median(f2s)) if f2s else 1650.0
+    f3 = float(np.median(f3s)) if f3s else 2750.0
+    return f1, f2, f3
+
+
 def analyze_target_voice(audio_path: Path, max_sec: float = 45.0) -> Dict:
     y, sr = librosa.load(str(audio_path), sr=22050, mono=True)
     if max_sec > 0 and len(y) > int(max_sec * sr):
@@ -54,8 +87,8 @@ def analyze_target_voice(audio_path: Path, max_sec: float = 45.0) -> Dict:
     rms = librosa.feature.rms(y=y, hop_length=hop)[0]
     rms_thresh = max(0.012, float(np.percentile(rms, 60)) * 0.45)
 
-    # 1. Pitch (F0) via pYIN
-    f0, voiced_flag, _ = librosa.pyin(
+    # 1. Pitch (F0) via pYIN up to C7
+    f0, _, _ = librosa.pyin(
         y,
         fmin=librosa.note_to_hz("C2"),
         fmax=librosa.note_to_hz("C7"),
@@ -72,7 +105,12 @@ def analyze_target_voice(audio_path: Path, max_sec: float = 45.0) -> Dict:
     p90_f0 = float(np.percentile(valid_f0, 90))
     median_midi = float(librosa.hz_to_midi(median_f0))
 
-    # 2. Spectral band energy balance (matching CHIMERA's CSD diagnostic bands)
+    # 2. LPC Formants -> Vocal Tract Length (VTL) scale factor
+    f1, f2, f3 = estimate_lpc_formants(y, sr, valid_mask, hop)
+    # Reference adult female average formants: F1~550, F2~1650, F3~2750
+    vtl_ratio = ((f1 / 550.0) * 0.25 + (f2 / 1650.0) * 0.35 + (f3 / 2750.0) * 0.40)
+
+    # 3. Spectral band energy balance
     S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop)) ** 2
     freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
     S_voiced = S[:, valid_mask]
@@ -81,33 +119,29 @@ def analyze_target_voice(audio_path: Path, max_sec: float = 45.0) -> Dict:
         m = (freqs >= f_lo) & (freqs < f_hi)
         if not np.any(m):
             return -80.0
-        val = float(np.mean(S_voiced[m, :]))
-        return 10.0 * np.log10(val + 1e-12)
+        return 10.0 * np.log10(float(np.mean(S_voiced[m, :])) + 1e-12)
 
     low_db = band_db(80, 500)
     mid_db = band_db(500, 2000)
     pres_db = band_db(2000, 4000)
     air_db = band_db(4000, 8000)
 
-    # Spectral tilt & brightness
-    tilt_pres = pres_db - low_db      # higher => brighter / more twang & pressed
-    tilt_air = air_db - mid_db        # higher => more breathy / airy
+    tilt_pres = pres_db - low_db
+    tilt_air = air_db - mid_db
 
-    # 3. Spectral flatness & pitch jitter -> breathiness & roughness
+    # 4. Flatness & jitter -> breathiness & roughness
     flatness = librosa.feature.spectral_flatness(S=np.sqrt(S + 1e-12))[0][valid_mask]
     mean_flatness = float(np.median(flatness))
 
-    # Frame-to-frame F0 jitter in semitones on contiguous voiced frames
     midi_track = np.where(valid_mask, librosa.hz_to_midi(np.nan_to_num(f0, nan=median_f0)), np.nan)
     diffs = np.abs(np.diff(midi_track))
     diffs = diffs[~np.isnan(diffs)]
-    diffs = diffs[diffs < 2.0]  # ignore octave jumps
+    diffs = diffs[diffs < 2.0]
     jitter_semitones = float(np.median(diffs)) if len(diffs) > 5 else 0.05
 
-    # 4. Vibrato estimation on sustained voiced runs (>= 0.45s)
+    # 5. Vibrato estimation
     frame_rate = sr / hop
-    vib_rates = []
-    vib_depths_cents = []
+    vib_rates, vib_depths_cents = [], []
     run_start = None
     for i, ok in enumerate(valid_mask):
         if ok and run_start is None:
@@ -115,32 +149,35 @@ def analyze_target_voice(audio_path: Path, max_sec: float = 45.0) -> Dict:
         elif not ok and run_start is not None:
             if i - run_start >= int(0.45 * frame_rate):
                 seg = midi_track[run_start:i]
-                seg = seg - np.linspace(seg[0], seg[-1], len(seg))  # detrend
+                seg = seg - np.linspace(seg[0], seg[-1], len(seg))
                 spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg))))
                 f_axis = np.fft.rfftfreq(len(seg), d=1.0 / frame_rate)
                 v_mask = (f_axis >= 4.0) & (f_axis <= 8.0)
                 if np.any(v_mask):
                     idx = int(np.argmax(spec[v_mask]))
                     vib_rates.append(float(f_axis[v_mask][idx]))
-                    vib_depths_cents.append(float(np.std(seg) * 141.4))  # RMS->peak cents
+                    vib_depths_cents.append(float(np.std(seg) * 141.4))
             run_start = None
 
     vib_rate_hz = round(float(np.median(vib_rates)), 2) if vib_rates else 5.5
-    vib_depth_cents = int(round(clamp(float(np.median(vib_depths_cents)) if vib_depths_cents else 25.0, 0, 80)))
+    vib_depth_cents = int(round(clamp(float(np.median(vib_depths_cents)) if vib_depths_cents else 20.0, 0, 80)))
 
-    # 5. Map acoustic features to CHIMERA body blend & encoder parameters (0..100 scale)
-    # Body blend: male (~120 Hz), female (~230 Hz), child (~330+ Hz)
-    if median_f0 <= 165.0:
-        female_w = clamp((median_f0 - 115.0) / 110.0, 0.0, 0.45)
+    # 6. Formant + Pitch combined Body Blend (accurate for bright/cute/character voices!)
+    # Combine F0 and VTL formant ratio so high-formant voices move cleanly toward child/bright female
+    pitch_score = clamp((median_f0 - 110.0) / 240.0, 0.0, 1.3)
+    formant_score = clamp((vtl_ratio - 0.80) / 0.35, 0.0, 1.3)
+    combined = 0.55 * pitch_score + 0.45 * formant_score
+
+    if combined < 0.40:
+        female_w = clamp(combined * 1.1, 0.0, 0.40)
         child_w = 0.0
-    elif median_f0 <= 290.0:
-        female_w = clamp((median_f0 - 140.0) / 120.0, 0.45, 1.0)
-        child_w = clamp((median_f0 - 250.0) / 140.0, 0.0, 0.35)
+    elif combined < 0.82:
+        female_w = clamp(0.45 + (combined - 0.40) * 1.3, 0.45, 1.0)
+        child_w = clamp((combined - 0.55) * 1.1, 0.0, 0.45)
     else:
-        child_w = clamp((median_f0 - 260.0) / 140.0, 0.35, 1.0)
-        female_w = clamp(1.0 - child_w * 0.7, 0.15, 0.7)
+        child_w = clamp(0.45 + (combined - 0.82) * 1.4, 0.45, 1.0)
+        female_w = clamp(1.0 - child_w * 0.65, 0.15, 0.70)
 
-    # Base CLI preset recommendation
     if child_w >= 0.45:
         cli_body = "child"
     elif female_w >= 0.45:
@@ -148,18 +185,30 @@ def analyze_target_voice(audio_path: Path, max_sec: float = 45.0) -> Dict:
     else:
         cli_body = "male"
 
-    # CHIMERA encoder estimates (0-100%)
-    breathy_pct = int(round(clamp((tilt_air + 34.0) * 2.2 + mean_flatness * 180.0, 5, 85)))
-    pressed_pct = int(round(clamp((tilt_pres + 26.0) * 2.4, 10, 90)))
-    twang_pct = int(round(clamp((pres_db - mid_db + 22.0) * 2.8, 5, 90)))
-    rough_pct = int(round(clamp((jitter_semitones - 0.03) * 320.0, 0, 75)))
+    # Expressive timbre parameters (wider dynamic range so custom synths sound noticeably distinct!)
+    energy_rms = float(np.percentile(rms[valid_mask], 80))
+    pressure_val = round(clamp(7.5 + energy_rms * 32.0 + (tilt_pres + 18.0) * 0.12, 6.0, 16.5), 2)
+    breathy_pct = int(round(clamp((tilt_air + 32.0) * 1.9 + mean_flatness * 160.0, 5, 85)))
+    pressed_pct = int(round(clamp((tilt_pres + 22.0) * 2.5, 15, 92)))
+    twang_pct = int(round(clamp((pres_db - mid_db + 20.0) * 3.0 + (vtl_ratio - 1.0) * 80.0, 10, 95)))
+    rough_pct = int(round(clamp((jitter_semitones - 0.035) * 300.0, 0, 75)))
     fry_pct = int(round(clamp((130.0 - p10_f0) * 0.9, 0, 45))) if p10_f0 < 130 else 0
-    larynx_pct = int(round(clamp(50.0 + (median_f0 - 210.0) * 0.15 + (tilt_pres + 15.0) * 0.6, 15, 85)))
-    ring_pct = int(round(clamp((pres_db - low_db + 20.0) * 2.5, 0, 85)))
+    larynx_pct = int(round(clamp(50.0 + (vtl_ratio - 1.0) * 110.0 + (median_f0 - 210.0) * 0.08, 10, 95)))
+    ring_pct = int(round(clamp((pres_db - low_db + 18.0) * 2.6, 5, 90)))
 
-    # MFCC signature for optional CHIMERA candidate comparison
+    # Native CHIMERA SourcePatch dict (used directly by patched render.rs!)
+    source_patch = {
+        "pressure": pressure_val,
+        "tension": round(pressed_pct / 100.0, 3),
+        "breathiness": round(breathy_pct / 100.0, 3),
+        "roughness": round(rough_pct / 100.0, 3),
+        "fry": round(fry_pct / 100.0, 3),
+        "vibrato_rate": vib_rate_hz,
+        "glide": 0.045,
+    }
+
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, hop_length=hop)[:, valid_mask]
-    mfcc_mean = np.mean(mfcc[1:], axis=1)  # drop c0 energy
+    mfcc_mean = np.mean(mfcc[1:], axis=1)
 
     return {
         "source_file": str(audio_path),
@@ -167,6 +216,8 @@ def analyze_target_voice(audio_path: Path, max_sec: float = 45.0) -> Dict:
             "median_f0_hz": round(median_f0, 1),
             "median_midi": round(median_midi, 1),
             "f0_range_hz": [round(p10_f0, 1), round(p90_f0, 1)],
+            "formants_hz": {"F1": round(f1, 0), "F2": round(f2, 0), "F3": round(f3, 0)},
+            "vtl_ratio": round(vtl_ratio, 3),
             "bands_db": {
                 "80_500hz": round(low_db, 1),
                 "500_2000hz": round(mid_db, 1),
@@ -183,6 +234,7 @@ def analyze_target_voice(audio_path: Path, max_sec: float = 45.0) -> Dict:
                 "female": round(female_w, 2),
                 "child": round(child_w, 2),
             },
+            "source": source_patch,
             "play_voice": {
                 "pitch_hz": round(median_f0, 1),
                 "pressed_pct": pressed_pct,
@@ -209,7 +261,6 @@ def analyze_target_voice(audio_path: Path, max_sec: float = 45.0) -> Dict:
 
 
 def compare_against_chimera_bodies(chimera_exe: Path, target_mfcc: np.ndarray) -> Dict[str, float]:
-    """Renders CHIMERA's 3 base bodies (`render vowels`) and computes MFCC Euclidean distance."""
     scores: Dict[str, float] = {}
     with tempfile.TemporaryDirectory() as td:
         for body in ("male", "female", "child"):
@@ -224,17 +275,16 @@ def compare_against_chimera_bodies(chimera_exe: Path, target_mfcc: np.ndarray) -
                 y, sr = librosa.load(str(wav_path), sr=22050, mono=True)
                 mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
                 cand = np.mean(mfcc[1:], axis=1)
-                dist = float(np.linalg.norm(target_mfcc - cand))
-                scores[body] = round(dist, 2)
+                scores[body] = round(float(np.linalg.norm(target_mfcc - cand)), 2)
     return scores
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Analyze a target voice and recommend CHIMERA synth preset values.")
+    parser = argparse.ArgumentParser(description="Analyze a target voice and compute CHIMERA synth preset values.")
     parser.add_argument("--audio", required=True, help="Path to clean vocal audio file (WAV/MP3)")
     parser.add_argument("--max-sec", type=float, default=45.0, help="Max seconds to analyze (default: 45)")
-    parser.add_argument("--out", default="", help="Optional path to save preset JSON (e.g. my_voice_preset.json)")
-    parser.add_argument("--compare-chimera", action="store_true", help="Also compare MFCC distance against chimera.exe bodies")
+    parser.add_argument("--out", default="", help="Optional path to save preset JSON")
+    parser.add_argument("--compare-chimera", action="store_true", help="Compare MFCC distance against chimera.exe")
     args = parser.parse_args()
 
     audio_path = Path(args.audio).resolve()
@@ -247,33 +297,22 @@ def main() -> None:
     if args.compare_chimera:
         exe = find_chimera_exe(Path.cwd())
         if exe:
-            print("Comparing timbre against CHIMERA male / female / child bodies...")
             scores = compare_against_chimera_bodies(exe, target_mfcc)
             if scores:
                 result["chimera_mfcc_distance"] = scores
-                best = min(scores, key=scores.get)
-                result["chimera_preset"]["cli_body_by_timbre"] = best
+                result["chimera_preset"]["cli_body_by_timbre"] = min(scores, key=scores.get)
 
     p = result["chimera_preset"]
     ac = result["acoustics"]
-
-    print("\n================ CHIMERA VOICE PRESET ================")
-    print(f"Target Audio   : {audio_path.name}")
-    print(f"Median Pitch   : {ac['median_f0_hz']} Hz (MIDI {ac['median_midi']}, range {ac['f0_range_hz'][0]}~{ac['f0_range_hz'][1]} Hz)")
-    print(f"CLI Base Body  : {p['cli_body']}  |  BodyPad Blend: {p['body_blend']}")
-    if "chimera_mfcc_distance" in result:
-        print(f"MFCC Distance  : {result['chimera_mfcc_distance']} (lower = closer timbre)")
-    print("\n[Play Mode Encoders]")
-    print(f"  VOICE        : pitch={p['play_voice']['pitch_hz']} Hz, pressed={p['play_voice']['pressed_pct']}%, vibrato={p['play_voice']['vibrato_cents']} cents")
-    print(f"  TONE         : breathy={p['play_tone']['breathy_pct']}%, rough={p['play_tone']['rough_pct']}%, fry={p['play_tone']['fry_pct']}%")
-    print(f"  THROAT/LARYNX: larynx={p['play_throat_larynx']['larynx_pct']}%, twang={p['play_throat_larynx']['twang_pct']}%")
-    print("\n[Sing Mode Encoders]")
-    print(f"  SONG         : vibrato={p['sing_encoders']['vibrato_depth_cents']} cents @ {p['sing_encoders']['vibrato_rate_hz']} Hz, breathy={p['sing_encoders']['breathy_pct']}%, ring={p['sing_encoders']['ring_pct']}%")
-    print("======================================================\n")
+    print("\n================ CHIMERA VOICE PRESET v2 ================")
+    print(f"Target Audio : {audio_path.name}")
+    print(f"Pitch / VTL  : {ac['median_f0_hz']} Hz (MIDI {ac['median_midi']}) | Formants {ac['formants_hz']} (VTL={ac['vtl_ratio']})")
+    print(f"Body Blend   : {p['body_blend']} (CLI: {p['cli_body']})")
+    print(f"SourcePatch  : {p['source']}")
+    print("=========================================================\n")
 
     if args.out:
         Path(args.out).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"Saved preset JSON -> {args.out}")
 
 
 if __name__ == "__main__":

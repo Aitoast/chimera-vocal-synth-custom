@@ -264,7 +264,7 @@ function autoShowPlugin(): Plugin {
             const lyrics = String(body.lyrics || "").trim();
             const lang = String(body.lang || "auto").trim();
             const voices = String(body.voices || "male,female,child").trim();
-            const mode = body.mode === "register" ? "register" : "alternate";
+            const mode = body.mode === "register" ? "register" : body.mode === "harmony" ? "harmony" : "alternate";
             const maxSec = Number(body.maxSec || 0);
             const title = String(body.title || "").trim();
             const rawId = String(body.id || "").trim().replace(/[^a-zA-Z0-9_-]/g, "");

@@ -74,6 +74,8 @@ def find_ffmpeg_dir() -> Optional[str]:
 
 
 def download_youtube_audio(url: str, work_dir: Path) -> Path:
+    if "/results?" in url or "/playlist?" in url:
+        raise ValueError("검색 결과나 재생목록 주소가 아닌, 개별 유튜브 영상 주소(watch?v=...)를 입력해 주세요.")
     out_tpl = str(work_dir / "source.%(ext)s")
     ff_dir = find_ffmpeg_dir()
     cmd = [
@@ -81,6 +83,8 @@ def download_youtube_audio(url: str, work_dir: Path) -> Path:
         "-m",
         "yt_dlp",
         "--no-playlist",
+        "--playlist-items",
+        "1",
         "--newline",
         "-x",
         "--audio-format",
@@ -249,6 +253,86 @@ def count_chimera_syllables(chimera_exe: Path, text: str) -> int:
     return max(1, hangul + latin_syls)
 
 
+def fetch_chimera_syllables(chimera_exe: Path, text: str) -> Optional[List[dict]]:
+    """Calls `chimera.exe syllables <text>` and returns the parsed Syllable[] JSON list."""
+    clean = text.strip()
+    if not clean:
+        return []
+    res = subprocess.run(
+        [str(chimera_exe), "syllables", clean],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if res.returncode == 0 and res.stdout.strip():
+        try:
+            data = json.loads(res.stdout)
+            if isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def sample_pitch_and_bends(
+    times: np.ndarray,
+    f0: np.ndarray,
+    s0: float,
+    s1: float,
+    fallback: int = 65,
+) -> Tuple[int, List[dict]]:
+    """
+    Samples median MIDI pitch and computes CHIMERA `Bend` objects (`at`: start|middle|end, `len`, `max`, `st`)
+    capturing upward scoops, falling drops, and anime-style rapid pitch bends within the syllable!
+    """
+    i0 = int(np.searchsorted(times, s0))
+    i1 = max(i0 + 1, int(np.searchsorted(times, s1)))
+    seg_f0 = f0[i0:i1]
+    valid = seg_f0[~np.isnan(seg_f0)]
+    if len(valid) == 0:
+        return fallback, []
+
+    midis = librosa.hz_to_midi(valid)
+    base_midi_f = float(np.median(midis))
+    base_midi = max(40, min(90, int(round(base_midi_f))))
+
+    bends: List[dict] = []
+    if len(midis) >= 6:
+        third = max(1, len(midis) // 3)
+        start_m = float(np.median(midis[:third]))
+        mid_m = float(np.median(midis[third : 2 * third]))
+        end_m = float(np.median(midis[-third:]))
+
+        d_start = start_m - base_midi_f
+        d_mid = mid_m - base_midi_f
+        d_end = end_m - base_midi_f
+
+        if abs(d_start) >= 1.2:
+            bends.append({
+                "at": "start",
+                "len": 0.35,
+                "max": 0.25,
+                "st": round(max(-12.0, min(12.0, d_start)), 2),
+            })
+        if abs(d_end) >= 1.2:
+            bends.append({
+                "at": "end",
+                "len": 0.35,
+                "max": 0.25,
+                "st": round(max(-12.0, min(12.0, d_end)), 2),
+            })
+        if not bends and abs(d_mid) >= 1.8:
+            bends.append({
+                "at": "middle",
+                "len": 0.40,
+                "max": 0.25,
+                "st": round(max(-12.0, min(12.0, d_mid)), 2),
+            })
+
+    return base_midi, bends
+
+
 def sample_pitch_midi(times: np.ndarray, f0: np.ndarray, s0: float, s1: float, fallback: int = 65) -> int:
     i0 = int(np.searchsorted(times, s0))
     i1 = max(i0 + 1, int(np.searchsorted(times, s1)))
@@ -310,7 +394,7 @@ def extract_phrases_with_whisper(
     rms: np.ndarray,
     centroid: np.ndarray,
     language: Optional[str] = None,
-    whisper_model_name: str = "small",
+    whisper_model_name: str = "large-v3-turbo",
 ) -> List[dict]:
     """
     1. Transcribes sung words via faster-whisper (with vad_filter=False so singing/chants aren't dropped).
@@ -376,7 +460,7 @@ def extract_phrases_with_whisper(
                 continue
             # Reject stretched Whisper hallucinations (>1.25s) or low-confidence guesses on non-words/screams
             w_prob = float(getattr(w, "probability", 1.0) or 1.0)
-            if (w_end - w_start) > 1.25 or w_prob < 0.35:
+            if (w_end - w_start) > 1.35 or w_prob < 0.22:
                 continue
 
             # Verify there is actual vocal energy during this Whisper word (ignore Whisper hallucinations in silence)
@@ -391,15 +475,15 @@ def extract_phrases_with_whisper(
             for k in range(n_syl):
                 s0 = w_start + k * slot
                 s1 = s0 + slot
-                m = sample_pitch_midi(times, f0, s0, s1, fallback=last_midi)
+                m, bends = sample_pitch_and_bends(times, f0, s0, s1, fallback=last_midi)
                 last_midi = m
-                notes_sec.append((m, s0, s1))
+                notes_sec.append((m, s0, s1, bends))
 
         if line_words and notes_sec:
             t_st = notes_sec[0][1]
             t_en = notes_sec[-1][2]
             covered_intervals.append((t_st, t_en))
-            median_m = int(round(float(np.median([m for m, _, _ in notes_sec]))))
+            median_m = int(round(float(np.median([m for m, _, _, *_ in notes_sec]))))
             line_text = " ".join(line_words)
             print(f"  [{t_st:5.1f}s - {t_en:5.1f}s] (whisper) {line_text}", flush=True)
             phrases.append(
@@ -420,8 +504,8 @@ def extract_phrases_with_whisper(
         sr=sr,
         hop_length=256,
         backtrack=False,
-        delta=0.06,
-        wait=7,  # minimum ~80ms between rapid staccato shouts
+        delta=0.045,
+        wait=4,  # minimum ~46ms between rapid staccato hits
     )
     onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=256)
 
@@ -432,14 +516,14 @@ def extract_phrases_with_whisper(
         return False
 
     # Build individual uncovered onset notes (s0, s1, midi, syllable)
-    raw_hits: List[Tuple[float, float, int, str]] = []
+    raw_hits: List[Tuple[float, float, int, str, List[dict]]] = []
     for idx, t0 in enumerate(onset_times):
         t0 = float(t0)
         if t0 >= dur_sec - 0.05 or is_covered(t0):
             continue
         t_next = float(onset_times[idx + 1]) if idx + 1 < len(onset_times) else dur_sec
         t_end_max = min(dur_sec, t0 + 0.65, t_next - 0.02)
-        if t_end_max <= t0 + 0.06:
+        if t_end_max <= t0 + 0.04:
             continue
 
         # Trim hit end where RMS drops below floor
@@ -453,23 +537,23 @@ def extract_phrases_with_whisper(
         if len(above) == 0:
             continue
         t1 = min(t_end_max, float(times[min(len(times) - 1, i0 + int(above[-1]) + 1)]))
-        t1 = max(t0 + 0.08, t1)
+        t1 = max(t0 + 0.06, t1)
 
-        m = sample_pitch_midi(times, f0, t0, t1, fallback=last_midi)
+        m, bends = sample_pitch_and_bends(times, f0, t0, t1, fallback=last_midi)
         last_midi = m
         cent = float(np.median(centroid[i0 : max(i0 + 1, int(np.searchsorted(times, t1)))]))
         syl = pick_scat_syllable(cent, m, is_short=(t1 - t0) < 0.24)
-        raw_hits.append((t0, t1, m, syl))
+        raw_hits.append((t0, t1, m, syl, bends))
 
     # Group consecutive onset hits into phrases (split on pauses > 0.65s or > 10 hits)
     scat_phrases = 0
     if raw_hits:
-        cur_group: List[Tuple[float, float, int, str]] = [raw_hits[0]]
+        cur_group: List[Tuple[float, float, int, str, List[dict]]] = [raw_hits[0]]
 
-        def flush_group(grp: List[Tuple[float, float, int, str]]):
+        def flush_group(grp: List[Tuple[float, float, int, str, List[dict]]]):
             nonlocal scat_phrases
             text = " ".join(h[3] for h in grp)
-            notes_sec = [(h[2], h[0], h[1]) for h in grp]
+            notes_sec = [(h[2], h[0], h[1], h[4]) for h in grp]
             median_m = int(round(float(np.median([h[2] for h in grp]))))
             phrases.append(
                 {
@@ -559,11 +643,11 @@ def extract_phrases_manual_lyrics(
         for k in range(n_syl):
             s0 = t_start + k * slot_dur
             s1 = s0 + slot_dur
-            m = sample_pitch_midi(times, f0, s0, s1, fallback=last_midi)
+            m, bends = sample_pitch_and_bends(times, f0, s0, s1, fallback=last_midi)
             last_midi = m
-            notes_sec.append((m, s0, s1))
+            notes_sec.append((m, s0, s1, bends))
 
-        median_midi = int(round(float(np.median([m for m, _, _ in notes_sec]))))
+        median_midi = int(round(float(np.median([m for m, _, _, *_ in notes_sec]))))
         phrases_out.append(
             {
                 "text": text,
@@ -576,9 +660,107 @@ def extract_phrases_manual_lyrics(
     return phrases_out
 
 
-def assign_voices(phrases: List[dict], voices: List[str], mode: str = "alternate") -> List[List[dict]]:
+# Krumhansl-Schmuckler major/minor key profiles for automatic scale detection & pitch snapping
+_MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
+_MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+_MAJOR_STEPS = [0, 2, 4, 5, 7, 9, 11]
+_MINOR_STEPS = [0, 2, 3, 5, 7, 8, 10]
+_KEY_NAMES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+
+
+def detect_key_scale(phrases: List[dict]) -> Tuple[int, List[int], str]:
+    hist = np.zeros(12, dtype=np.float64)
+    for p in phrases:
+        for m, s0, s1, *_ in p["notes_sec"]:
+            if m > 0:
+                hist[int(m) % 12] += max(0.05, s1 - s0)
+    if np.sum(hist) < 1e-6:
+        return 0, _MAJOR_STEPS, "C Major"
+    best_score = -1e9
+    best_root = 0
+    best_steps = _MAJOR_STEPS
+    best_name = "C Major"
+    for root in range(12):
+        rolled = np.roll(hist, -root)
+        sc_maj = float(np.corrcoef(rolled, _MAJOR_PROFILE)[0, 1])
+        if sc_maj > best_score:
+            best_score, best_root, best_steps, best_name = sc_maj, root, _MAJOR_STEPS, f"{_KEY_NAMES[root]} Major"
+        sc_min = float(np.corrcoef(rolled, _MINOR_PROFILE)[0, 1])
+        if sc_min > best_score:
+            best_score, best_root, best_steps, best_name = sc_min, root, _MINOR_STEPS, f"{_KEY_NAMES[root]} Minor"
+    return best_root, best_steps, best_name
+
+
+def snap_to_scale(midi_val: int, root: int, steps: List[int]) -> int:
+    pc = (midi_val - root) % 12
+    best_d = 99
+    best_step = pc
+    for st in steps:
+        for delta in (-12, 0, 12):
+            d = (st + delta) - pc
+            if abs(d) < abs(best_d):
+                best_d = d
+                best_step = st + delta
+    return max(40, min(88, midi_val + (best_step - pc)))
+
+
+def shift_diatonic(midi_val: int, degree_shift: int, root: int, steps: List[int]) -> int:
+    snapped = snap_to_scale(midi_val, root, steps)
+    pc = (snapped - root) % 12
+    octave = (snapped - root) // 12
+    idx = min(range(len(steps)), key=lambda i: abs(steps[i] - pc))
+    new_idx = idx + degree_shift
+    oct_delta = new_idx // len(steps)
+    rem = new_idx % len(steps)
+    return max(40, min(88, root + (octave + oct_delta) * 12 + steps[rem]))
+
+
+def quantize_phrases_to_scale(phrases: List[dict]) -> Tuple[int, List[int], str]:
+    root, steps, key_name = detect_key_scale(phrases)
+    print(f"  Detected musical key: {key_name} (snapping pitches to scale)", flush=True)
+    for p in phrases:
+        snapped_notes = [(snap_to_scale(m, root, steps), s0, s1, bends) for m, s0, s1, bends in p["notes_sec"]]
+        p["notes_sec"] = snapped_notes
+        p["median_midi"] = int(round(float(np.median([m for m, _, _, *_ in snapped_notes]))))
+    return root, steps, key_name
+
+
+def assign_voices(
+    phrases: List[dict],
+    voices: List[str],
+    mode: str = "alternate",
+    scale_info: Optional[Tuple[int, List[int], str]] = None,
+) -> List[List[dict]]:
     n_v = len(voices)
     per_voice: List[List[dict]] = [[] for _ in range(n_v)]
+
+    if mode == "harmony":
+        root, steps, _ = scale_info if scale_info else (0, _MAJOR_STEPS, "C Major")
+        # Choir/Harmony mode: all voices sing together with musical diatonic voicings + slight human timing offset
+        for v_i, body_type in enumerate(voices):
+            if v_i == 0:
+                deg_shift, t_offset = 0, 0.0           # Main lead melody
+            elif v_i == 1:
+                deg_shift, t_offset = 2, 0.012         # Diatonic 3rd above (+12ms humanize)
+            elif body_type == "male":
+                deg_shift, t_offset = -7, -0.010       # Octave below bass (-10ms humanize)
+            else:
+                deg_shift, t_offset = -2, -0.010       # Diatonic 3rd below
+            for p in phrases:
+                harm_notes = [
+                    (shift_diatonic(m, deg_shift, root, steps), max(0.0, s0 + t_offset), max(0.08, s1 + t_offset), bends)
+                    for m, s0, s1, bends in p["notes_sec"]
+                ]
+                per_voice[v_i].append(
+                    {
+                        "text": p["text"],
+                        "t_start": max(0.0, p["t_start"] + t_offset),
+                        "t_end": max(0.1, p["t_end"] + t_offset),
+                        "median_midi": int(round(float(np.median([m for m, _, _, *_ in harm_notes])))),
+                        "notes_sec": harm_notes,
+                    }
+                )
+        return per_voice
 
     if mode == "register" and n_v >= 2:
         pitches = sorted(p["median_midi"] for p in phrases)
@@ -606,11 +788,14 @@ def build_melody_json(
     bpm: float,
     body_type: str,
     target_midi: Optional[float] = None,
+    chimera_exe: Optional[Path] = None,
+    source_patch: Optional[dict] = None,
 ) -> dict:
     spb = 60.0 / bpm
     notes: List[List[float]] = []
     lyrics_parts: List[str] = []
     cursor_beats = 0.0
+    all_bends: List[List[dict]] = []
 
     def fit_midi(m: int) -> int:
         if target_midi is not None:
@@ -646,15 +831,18 @@ def build_melody_json(
             cursor_beats += gap
 
         lyrics_parts.append(p["text"])
-        for midi_val, s0, s1 in p["notes_sec"]:
+        for entry in p["notes_sec"]:
+            midi_val, s0, s1 = entry[0], entry[1], entry[2]
+            bends = entry[3] if len(entry) > 3 else []
             note_start_b = round(s0 / spb, 3)
             inner_gap = round(note_start_b - cursor_beats, 3)
-            if inner_gap >= 0.06:
+            if inner_gap >= 0.03:
                 notes.append([0, inner_gap])
                 cursor_beats += inner_gap
-            dur_b = max(0.10, min(2.5, round((s1 - s0) / spb, 3)))
+            dur_b = max(0.07, min(2.5, round((s1 - s0) / spb, 3)))
             notes.append([fit_midi(midi_val), dur_b])
             cursor_beats += dur_b
+            all_bends.append(bends)
 
     # Adaptive vibrato: crisp/dry for fast rap & chants, gentle for pop/ballads
     sounding_durs = [b * spb for m, b in notes if m > 0]
@@ -666,13 +854,30 @@ def build_melody_json(
     else:
         vibrato = 28.0
 
-    return {
+    lyrics_str = " ".join(lyrics_parts)
+    out_obj: dict = {
         "bpm": bpm,
         "t0": CHIMERA_T0,
         "vibrato": vibrato,
-        "lyrics": " ".join(lyrics_parts),
+        "lyrics": lyrics_str,
         "notes": notes,
     }
+    if source_patch:
+        out_obj["source"] = source_patch
+
+    # Attach real per-syllable pitch bends via CHIMERA's native `syllables` schema!
+    if chimera_exe is not None and any(all_bends):
+        syls = fetch_chimera_syllables(chimera_exe, lyrics_str)
+        if syls and len(syls) == len(all_bends):
+            bend_count = 0
+            for syl_obj, b_list in zip(syls, all_bends):
+                if b_list:
+                    syl_obj["pitch"] = b_list
+                    bend_count += len(b_list)
+            out_obj["syllables"] = syls
+            print(f"    Attached {bend_count} real pitch bends across {len(syls)} syllables", flush=True)
+
+    return out_obj
 
 
 def mix_mr_and_vocals(
@@ -745,11 +950,11 @@ def main() -> None:
     src_group.add_argument("--audio", help="Path to local MP3/WAV audio file")
     parser.add_argument("--lyrics", default="", help="Optional UTF-8 lyrics file (omit to auto-transcribe)")
     parser.add_argument("--lang", default="auto", help="Whisper language hint: auto, en, ko, ja (default: auto)")
-    parser.add_argument("--whisper-model", default="small", help="faster-whisper model size (default: small)")
+    parser.add_argument("--whisper-model", default="large-v3-turbo", help="faster-whisper model size (default: large-v3-turbo)")
     parser.add_argument("--id", default="auto_show", help="Show folder ID under public/shows/<id>")
     parser.add_argument("--title", default="", help="Display title on the 3D show page")
     parser.add_argument("--voices", default="male,female,child", help="Comma-separated voices: male,female,child")
-    parser.add_argument("--mode", choices=["alternate", "register"], default="alternate", help="Part assignment mode")
+    parser.add_argument("--mode", choices=["alternate", "register", "harmony"], default="alternate", help="Part assignment mode")
     parser.add_argument("--max-sec", type=float, default=0.0, help="Optional max duration in seconds (0 = full video)")
     parser.add_argument("--mr-vol", type=float, default=0.55, help="Background MR volume (default: 0.55)")
     parser.add_argument("--vocal-vol", type=float, default=1.0, help="CHIMERA vocal volume (default: 1.0)")
@@ -774,7 +979,7 @@ def main() -> None:
     for rv in raw_voices:
         key = rv.lower()
         if key in {"male", "female", "child"}:
-            voice_specs.append({"body": key, "label": key.capitalize(), "target_midi": None})
+            voice_specs.append({"body": key, "label": key.capitalize(), "target_midi": None, "source": None})
         elif key in presets_map:
             pr = presets_map[key]
             cp = pr.get("chimera_preset", pr)
@@ -782,7 +987,8 @@ def main() -> None:
             if body not in {"male", "female", "child"}:
                 body = "female"
             t_midi = pr.get("acoustics", {}).get("median_midi")
-            voice_specs.append({"body": body, "label": pr.get("name", rv), "target_midi": t_midi})
+            src_patch = cp.get("source")
+            voice_specs.append({"body": body, "label": pr.get("name", rv), "target_midi": t_midi, "source": src_patch})
         else:
             raise ValueError(f"Unsupported voice '{rv}'. Use male, female, child, or a saved custom synth ID.")
     voices = [vs["body"] for vs in voice_specs]
@@ -834,8 +1040,9 @@ def main() -> None:
             whisper_model_name=args.whisper_model,
         )
 
-    # 5. Assign phrases across singers
-    assigned = assign_voices(phrases, voices, mode=args.mode)
+    # 5. Detect song key, snap pitches to scale, and assign parts across singers
+    scale_info = quantize_phrases_to_scale(phrases)
+    assigned = assign_voices(phrases, voices, mode=args.mode, scale_info=scale_info)
 
     # 6. Render each singer with CHIMERA (--tele for 3D heads)
     rendered_wavs: List[Path] = []
@@ -853,7 +1060,7 @@ def main() -> None:
         tele_path = show_dir / f"{stem}.tele"
         wav_stem = show_dir / stem
 
-        melody_obj = build_melody_json(assigned[idx], bpm, body_type, target_midi=vs["target_midi"])
+        melody_obj = build_melody_json(assigned[idx], bpm, body_type, target_midi=vs["target_midi"], chimera_exe=chimera_exe, source_patch=vs.get("source"))
         mel_path.write_text(json.dumps(melody_obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
         run_cmd(

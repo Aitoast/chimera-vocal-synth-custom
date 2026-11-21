@@ -586,11 +586,17 @@ pub fn notes(ctx: &Ctx, a: &[String]) -> Result<(), String> {
     let beat = 60.0 / bpm;
     let mut v = HumanVoice::new(FS, b, 2);
     let first = raw.iter().find(|n| n[0] > 0.0).ok_or("no notes")?;
+    let src = &j["source"];
     v.set_source(&SourcePatch {
         f0: Some(midi_to_hz(first[0])),
         voiced: Some(true),
-        pressure: Some(9.0),
-        tension: Some(0.55),
+        pressure: Some(src["pressure"].as_f64().unwrap_or(9.0)),
+        tension: Some(src["tension"].as_f64().unwrap_or(0.55)),
+        breathiness: src["breathiness"].as_f64(),
+        roughness: src["roughness"].as_f64(),
+        fry: src["fry"].as_f64(),
+        vibrato_rate: src["vibrato_rate"].as_f64(),
+        glide: src["glide"].as_f64(),
         ..Default::default()
     });
     let (mut t, mut k, mut end) = (t0, 0usize, 0.0f64);

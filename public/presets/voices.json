@@ -1,49 +1,49 @@
 [
   {
-    "id": "custom_synth_mwoztnwf_tnwf",
-    "name": "우사기",
+    "id": "custom_synth_mwp6m76h_m76h",
+    "name": "붘",
     "acoustics": {
-      "median_f0_hz": 378.6,
-      "median_midi": 66.4,
+      "median_f0_hz": 430,
+      "median_midi": 68.6,
       "f0_range_hz": [
-        282,
-        460.8
+        351.3,
+        611.6
       ],
       "bands_db": {
-        "80_500hz": 17.3,
-        "500_2000hz": 13.4,
-        "2000_4000hz": 12.6,
-        "4000_8000hz": 7.1
+        "80_500hz": 11.9,
+        "500_2000hz": 19.8,
+        "2000_4000hz": 14.8,
+        "4000_8000hz": 6.5
       },
       "jitter_semitones": 0.1,
-      "spectral_flatness": 0.0071
+      "spectral_flatness": 0.0011
     },
     "chimera_preset": {
       "cli_body": "child",
       "body_blend": {
-        "male": 0.15,
-        "female": 0.41,
-        "child": 0.85
+        "male": 0,
+        "female": 0.3,
+        "child": 1
       },
       "play_voice": {
-        "pitch_hz": 378.6,
-        "pressed_pct": 51,
-        "vibrato_cents": 79
+        "pitch_hz": 430,
+        "pressed_pct": 69,
+        "vibrato_cents": 80
       },
       "play_tone": {
-        "breathy_pct": 62,
+        "breathy_pct": 46,
         "rough_pct": 22,
         "fry_pct": 0
       },
       "play_throat_larynx": {
-        "larynx_pct": 81,
-        "twang_pct": 59
+        "larynx_pct": 85,
+        "twang_pct": 48
       },
       "sing_encoders": {
-        "vibrato_depth_cents": 79,
-        "vibrato_rate_hz": 5.56,
-        "breathy_pct": 62,
-        "ring_pct": 38
+        "vibrato_depth_cents": 80,
+        "vibrato_rate_hz": 5.25,
+        "breathy_pct": 46,
+        "ring_pct": 57
       },
       "cli_body_by_timbre": "female"
     }

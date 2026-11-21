@@ -409,6 +409,7 @@ function Wall(props: { onOpenShow: (id: string) => void }) {
   const mode = useStore((s) => s.mode);
   const setBody = useStore((s) => s.setBody);
   const setSource = useStore((s) => s.setSource);
+  const setArtic = useStore((s) => s.setArtic);
 
   const [customPresets, setCustomPresets] = useState<CustomVoicePreset[]>([]);
   const [activePresetId, setActivePresetId] = useState<string | null>(null);
@@ -425,11 +426,28 @@ function Wall(props: { onOpenShow: (id: string) => void }) {
 
   const applyCustomPreset = (p: CustomVoicePreset) => {
     setActivePresetId(p.id);
-    const blend = p.chimera_preset.body_blend;
+    const cp = p.chimera_preset;
+    const blend = cp.body_blend;
     setBody({ female: blend.female, child: blend.child });
-    if (p.chimera_preset.play_voice?.pitch_hz) {
-      setSource({ f0: p.chimera_preset.play_voice.pitch_hz });
-    }
+    const pv = cp.play_voice;
+    const pt = cp.play_tone;
+    const pl = cp.play_throat_larynx;
+    setSource({
+      f0: Math.max(40, Math.min(1100, pv.pitch_hz || 200)),
+      tension: Math.max(0, Math.min(1, (pv.pressed_pct ?? 50) / 100)),
+      vibratoDepth: Math.max(0, Math.min(120, pv.vibrato_cents ?? 25)),
+      brightness: Math.max(0, Math.min(1, (pl.twang_pct ?? 50) / 100)),
+      breathiness: Math.max(0, Math.min(1, (pt.breathy_pct ?? 20) / 100)),
+      roughness: Math.max(0, Math.min(1, (pt.rough_pct ?? 10) / 100)),
+      fry: Math.max(0, Math.min(1, (pt.fry_pct ?? 0) / 100)),
+    });
+    // Map larynx_pct (0..100) to CHIMERA's -1.5..+1.5 cm range, twang -> epilarynx (0..1), rough -> ventricular
+    const larynxCm = (((pl.larynx_pct ?? 50) - 50) / 50) * 1.3;
+    setArtic({
+      larynx: Math.max(-1.5, Math.min(1.5, larynxCm)),
+      epilarynx: Math.max(0, Math.min(1, (pl.twang_pct ?? 35) / 100)),
+      ventricular: Math.max(0, Math.min(1, ((pt.rough_pct ?? 0) * 0.7) / 100)),
+    });
   };
 
   return (
